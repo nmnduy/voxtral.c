@@ -28,6 +28,9 @@ make mps       # Apple Silicon (fastest)
 # Live microphone transcription (macOS, Ctrl+C to stop)
 ./voxtral -d voxtral-model --from-mic
 
+# Spacebar hold-to-record mode (macOS, SPACE to start, ENTER to stop)
+./voxtral -d voxtral-model --space --copy
+
 # Pipe any format via ffmpeg
 ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
     ./voxtral -d voxtral-model --stdin
@@ -58,6 +61,8 @@ This requires just PyTorch and a few standard libraries.
 - **Streaming C API**: Feed audio incrementally, get token strings back as they become available.
 - **Memory-mapped weights**: BF16 weights are mmap'd directly from safetensors, loading is near-instant.
 - **Live microphone input**: `--from-mic` captures and transcribes from the default microphone (macOS) with automatic silence detection.
+- **Spacebar recording**: `--space` hold-to-record mode — press SPACE to start, ENTER to stop. Loops continuously for multiple recordings.
+- **Clipboard integration**: `--copy` copies final transcription to clipboard (macOS, works with `--space` or file/stdin modes).
 - **WAV input**: Supports 16-bit PCM WAV files at any sample rate (auto-resampled to 16kHz).
 - **Chunked encoder**: Processes audio in overlapping chunks, bounding memory regardless of length.
 - **Rolling KV cache**: Decoder KV cache is automatically compacted when it exceeds the sliding window (8192 positions), capping memory usage and allowing unlimited-length audio.
@@ -161,7 +166,37 @@ The **`--from-mic` flag** captures audio from the default microphone (macOS only
 
 If the model falls behind real-time, a warning is printed and audio is skipped to catch up.
 
-`--from-mic`, `--stdin`, and `-i` are mutually exclusive.
+`--from-mic`, `--stdin`, `-i`, and `--space` are mutually exclusive.
+
+### Spacebar Recording Mode (`--space`)
+
+The **`--space` flag** provides a hold-to-record interface ideal for quick voice notes or transcription tasks:
+
+```bash
+./voxtral -d voxtral-model --space                    # basic spacebar mode
+./voxtral -d voxtral-model --space --copy             # auto-copy to clipboard
+./voxtral -d voxtral-model --space --silent           # no status output
+```
+
+**How it works:**
+- Press **SPACE** to start recording from the microphone
+- Press **ENTER** to stop recording
+- The transcription prints to stdout
+- The loop continues — press SPACE again for another recording
+- Press **Ctrl+C** to exit the program
+
+The `--space` mode is designed for workflows where you want to make multiple quick recordings without restarting the program. Unlike `--from-mic` which transcribes continuously, `--space` only processes audio when you explicitly trigger recording.
+
+### Clipboard Copy (`--copy`)
+
+The **`--copy` flag** copies the final transcription to the system clipboard using `pbcopy` (macOS only). Works with any input mode:
+
+```bash
+./voxtral -d voxtral-model -i audio.wav --copy        # copy file transcription
+./voxtral -d voxtral-model --space --copy             # copy each recording
+```
+
+With `--space`, each recording's transcription is copied after you press ENTER. With file or stdin input, the complete transcription is copied when finished.
 
 To convert files to WAV format, just use `ffmpeg`:
 
