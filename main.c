@@ -20,12 +20,26 @@
 #include <termios.h>
 #include <fcntl.h>
 #include <sys/select.h>
+#include <time.h>
 
 #define DEFAULT_FEED_CHUNK 16000 /* 1 second at 16kHz */
 
 /* SIGINT handler for clean exit from --from-mic */
 static volatile sig_atomic_t mic_interrupted = 0;
 static void sigint_handler(int sig) { (void)sig; mic_interrupted = 1; }
+
+/* Spacebar state tracking for --space mode */
+/* Key repeat rate is typically 20-30 Hz, so if we haven't seen a space in 100ms,
+   the key was likely released. Using 150ms for safety margin. */
+#define SPACEBAR_TIMEOUT_MS 150
+static volatile int spacebar_held = 0;
+static volatile uint64_t spacebar_last_seen_ms = 0;
+
+static uint64_t current_time_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 static void usage(const char *prog) {
     fprintf(stderr, "voxtral.c — Voxtral Realtime 4B speech-to-text\n\n");
@@ -177,17 +191,30 @@ static void tty_restore(void) {
     }
 }
 
-/* Check if spacebar is currently pressed (non-blocking) */
+/* Check if spacebar is currently pressed (non-blocking, with state tracking).
+   Uses key-repeat timeout since terminals don't send key release events in raw mode. */
 static int spacebar_is_pressed(void) {
     char c;
+    int saw_space = 0;
     while (read(STDIN_FILENO, &c, 1) > 0) {
-        if (c == ' ') return 1;
-        if (c == 3 || c == 'q' || c == 'Q') { /* Ctrl+C or q */
+        if (c == ' ') {
+            saw_space = 1;
+            spacebar_last_seen_ms = current_time_ms();
+        } else if (c == 3 || c == 'q' || c == 'Q') { /* Ctrl+C or q */
             tty_restore();
             exit(0);
         }
     }
-    return 0;
+    if (saw_space) {
+        spacebar_held = 1;
+    } else if (spacebar_held) {
+        /* Check if we've timed out (no space seen recently = key released) */
+        uint64_t now = current_time_ms();
+        if (now - spacebar_last_seen_ms > SPACEBAR_TIMEOUT_MS) {
+            spacebar_held = 0;
+        }
+    }
+    return spacebar_held;
 }
 
 int main(int argc, char **argv) {
