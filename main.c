@@ -17,6 +17,9 @@
 #include <signal.h>
 #include <unistd.h>
 #include <math.h>
+#include <termios.h>
+#include <fcntl.h>
+#include <sys/select.h>
 
 #define DEFAULT_FEED_CHUNK 16000 /* 1 second at 16kHz */
 
@@ -36,6 +39,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -I <secs>     Encoder processing interval in seconds (default: 2.0)\n");
     fprintf(stderr, "  --alt <c>     Show alternative tokens within cutoff distance (0.0-1.0)\n");
     fprintf(stderr, "  --monitor     Show non-intrusive symbols inline with output (stderr)\n");
+    fprintf(stderr, "  --copy        Copy transcription to clipboard when done (macOS only)\n");
+    fprintf(stderr, "  --space       Hold spacebar to record, release to stop (macOS only)\n");
     fprintf(stderr, "  --debug       Debug output (per-layer, per-chunk details)\n");
     fprintf(stderr, "  --silent      No status output (only transcription on stdout)\n");
     fprintf(stderr, "  -h            Show this help\n");
@@ -43,6 +48,23 @@ static void usage(const char *prog) {
 
 /* Drain pending tokens from stream and print to stdout */
 static int first_token = 1;
+/* Accumulation buffer for --copy mode */
+static char *copy_buffer = NULL;
+static size_t copy_buffer_len = 0;
+static size_t copy_buffer_cap = 0;
+
+static void accum_copy(const char *text) {
+    if (!text || !copy_buffer) return;
+    size_t len = strlen(text);
+    if (copy_buffer_len + len + 1 > copy_buffer_cap) {
+        copy_buffer_cap = (copy_buffer_len + len + 1) * 2;
+        if (copy_buffer_cap < 4096) copy_buffer_cap = 4096;
+        copy_buffer = realloc(copy_buffer, copy_buffer_cap);
+    }
+    memcpy(copy_buffer + copy_buffer_len, text, len);
+    copy_buffer_len += len;
+    copy_buffer[copy_buffer_len] = '\0';
+}
 static float alt_cutoff = -1; /* <0 means disabled */
 
 static void drain_tokens(vox_stream_t *s) {
@@ -58,6 +80,7 @@ static void drain_tokens(vox_stream_t *s) {
                     first_token = 0;
                 }
                 fputs(t, stdout);
+                accum_copy(t);
             }
             fflush(stdout);
         }
@@ -87,6 +110,7 @@ static void drain_tokens(vox_stream_t *s) {
                             first_token = 0;
                         }
                         fputs(t, stdout);
+                        if (a == 0) accum_copy(t);
                     }
                     fputc(']', stdout);
                 } else {
@@ -96,6 +120,7 @@ static void drain_tokens(vox_stream_t *s) {
                         first_token = 0;
                     }
                     fputs(t, stdout);
+                    accum_copy(t);
                 }
             }
             fflush(stdout);
@@ -117,12 +142,62 @@ static void feed_and_drain(vox_stream_t *s, const float *samples, int n_samples)
     }
 }
 
+/* Copy text to clipboard using pbcopy (macOS) */
+static void copy_to_clipboard(const char *text) {
+    if (!text || !*text) return;
+    FILE *pbcopy = popen("pbcopy", "w");
+    if (pbcopy) {
+        fputs(text, pbcopy);
+        pclose(pbcopy);
+    }
+}
+
+/* Terminal raw mode for spacebar detection */
+static struct termios orig_termios;
+static int tty_raw_mode = 0;
+
+static void tty_set_raw(void) {
+    struct termios raw;
+    tcgetattr(STDIN_FILENO, &orig_termios);
+    raw = orig_termios;
+    raw.c_lflag &= ~(ECHO | ICANON);
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+    tty_raw_mode = 1;
+    /* Make stdin non-blocking */
+    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+}
+
+static void tty_restore(void) {
+    if (tty_raw_mode) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+        tty_raw_mode = 0;
+    }
+}
+
+/* Check if spacebar is currently pressed (non-blocking) */
+static int spacebar_is_pressed(void) {
+    char c;
+    while (read(STDIN_FILENO, &c, 1) > 0) {
+        if (c == ' ') return 1;
+        if (c == 3 || c == 'q' || c == 'Q') { /* Ctrl+C or q */
+            tty_restore();
+            exit(0);
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *model_dir = NULL;
     const char *input_wav = NULL;
     int verbosity = 1; /* 0=silent, 1=normal, 2=debug */
     int use_stdin = 0;
     int use_mic = 0;
+    int use_space = 0;
+    int do_copy = 0;
     float interval = -1.0f; /* <0 means use default */
 
     for (int i = 1; i < argc; i++) {
@@ -149,6 +224,10 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--monitor") == 0) {
             extern int vox_monitor;
             vox_monitor = 1;
+        } else if (strcmp(argv[i], "--copy") == 0) {
+            do_copy = 1;
+        } else if (strcmp(argv[i], "--space") == 0) {
+            use_space = 1;
         } else if (strcmp(argv[i], "--debug") == 0) {
             verbosity = 2;
         } else if (strcmp(argv[i], "--silent") == 0) {
@@ -163,17 +242,28 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (!model_dir || (!input_wav && !use_stdin && !use_mic)) {
+    if (!model_dir || (!input_wav && !use_stdin && !use_mic && !use_space)) {
         usage(argv[0]);
         return 1;
     }
-    if ((input_wav ? 1 : 0) + use_stdin + use_mic > 1) {
-        fprintf(stderr, "Error: -i, --stdin, and --from-mic are mutually exclusive\n");
+    if ((input_wav ? 1 : 0) + use_stdin + use_mic + use_space > 1) {
+        fprintf(stderr, "Error: -i, --stdin, --from-mic, and --space are mutually exclusive\n");
+        return 1;
+    }
+    if (use_space && use_stdin) {
+        fprintf(stderr, "Error: --space cannot be used with --stdin\n");
         return 1;
     }
 
     vox_verbose = verbosity;
     vox_verbose_audio = (verbosity >= 2) ? 1 : 0;
+
+    /* Initialize copy buffer if --copy is enabled */
+    if (do_copy) {
+        copy_buffer_cap = 4096;
+        copy_buffer = malloc(copy_buffer_cap);
+        copy_buffer[0] = '\0';
+    }
 
 #ifdef USE_METAL
     vox_metal_init();
@@ -376,6 +466,110 @@ int main(int argc, char **argv) {
             vox_stream_feed(s, fbuf, (int)nread);
             drain_tokens(s);
         }
+    } else if (use_space) {
+        /* Spacebar hold-to-record mode - loops until Ctrl+C */
+        if (vox_mic_start() != 0) {
+            vox_stream_free(s);
+            vox_free(ctx);
+            return 1;
+        }
+
+        /* Setup terminal for raw mode */
+        tty_set_raw();
+
+        /* Install atexit handler to restore terminal */
+        atexit(tty_restore);
+
+        /* Install SIGINT handler for clean exit */
+        struct sigaction sa;
+        sa.sa_handler = sigint_handler;
+        sa.sa_flags = 0;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGINT, &sa, NULL);
+
+        if (vox_verbose >= 1)
+            fprintf(stderr, "Hold SPACE to record, release to stop (Ctrl+C to exit)...\n");
+
+        /* Main loop - keep recording until interrupted */
+        while (!mic_interrupted) {
+            /* Wait for spacebar press */
+            if (vox_verbose >= 1)
+                fprintf(stderr, "\nWaiting for spacebar...\n");
+
+            while (!mic_interrupted && !spacebar_is_pressed()) {
+                usleep(10000); /* 10ms */
+            }
+
+            if (mic_interrupted)
+                break;
+
+            if (vox_verbose >= 1)
+                fprintf(stderr, "Recording...\n");
+
+            float mic_buf[4800]; /* 300ms max read */
+            int is_recording = 1;
+
+            while (!mic_interrupted && is_recording) {
+                /* Check if spacebar is still pressed */
+                if (!spacebar_is_pressed()) {
+                    /* Spacebar released - stop recording */
+                    is_recording = 0;
+                    break;
+                }
+
+                int n = vox_mic_read(mic_buf, 4800);
+                if (n > 0) {
+                    vox_stream_feed(s, mic_buf, n);
+                    drain_tokens(s);
+                } else {
+                    usleep(5000); /* 5ms idle sleep */
+                }
+            }
+
+            if (mic_interrupted)
+                break;
+
+            if (vox_verbose >= 1)
+                fprintf(stderr, "Processing...\n");
+
+            vox_stream_finish(s);
+            drain_tokens(s);
+            fputs("\n", stdout);
+            fflush(stdout);
+
+            /* Copy to clipboard if requested */
+            if (do_copy && copy_buffer && copy_buffer_len > 0) {
+                copy_to_clipboard(copy_buffer);
+                if (vox_verbose >= 1)
+                    fprintf(stderr, "Copied to clipboard\n");
+            }
+
+            /* Reset for next recording */
+            free(copy_buffer);
+            copy_buffer = NULL;
+            copy_buffer_len = 0;
+
+            vox_stream_free(s);
+            s = vox_stream_init(ctx);
+            if (!s) {
+                fprintf(stderr, "Failed to create stream\n");
+                break;
+            }
+
+            /* Small delay to debounce spacebar release */
+            usleep(200000); /* 200ms */
+        }
+
+        vox_mic_stop();
+        tty_restore();
+
+        /* Skip normal cleanup since we did it in the loop */
+        vox_stream_free(s);
+        vox_free(ctx);
+#ifdef USE_METAL
+        vox_metal_shutdown();
+#endif
+        return 0;
     } else {
         /* File input: load WAV, feed in chunks */
         int n_samples = 0;
@@ -399,6 +593,14 @@ int main(int argc, char **argv) {
     fputs("\n", stdout);
     fflush(stdout);
 
+    /* Copy to clipboard if requested */
+    if (do_copy && copy_buffer && copy_buffer_len > 0) {
+        copy_to_clipboard(copy_buffer);
+        if (vox_verbose >= 1)
+            fprintf(stderr, "Copied to clipboard\n");
+    }
+
+    free(copy_buffer);
     vox_stream_free(s);
     vox_free(ctx);
 #ifdef USE_METAL
