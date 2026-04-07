@@ -19,27 +19,12 @@
 #include <math.h>
 #include <termios.h>
 #include <fcntl.h>
-#include <sys/select.h>
-#include <time.h>
 
 #define DEFAULT_FEED_CHUNK 16000 /* 1 second at 16kHz */
 
 /* SIGINT handler for clean exit from --from-mic */
 static volatile sig_atomic_t mic_interrupted = 0;
 static void sigint_handler(int sig) { (void)sig; mic_interrupted = 1; }
-
-/* Spacebar state tracking for --space mode */
-/* Key repeat rate is typically 20-30 Hz, so if we haven't seen a space in 100ms,
-   the key was likely released. Using 150ms for safety margin. */
-#define SPACEBAR_TIMEOUT_MS 150
-static volatile int spacebar_held = 0;
-static volatile uint64_t spacebar_last_seen_ms = 0;
-
-static uint64_t current_time_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
 
 static void usage(const char *prog) {
     fprintf(stderr, "voxtral.c — Voxtral Realtime 4B speech-to-text\n\n");
@@ -54,7 +39,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --alt <c>     Show alternative tokens within cutoff distance (0.0-1.0)\n");
     fprintf(stderr, "  --monitor     Show non-intrusive symbols inline with output (stderr)\n");
     fprintf(stderr, "  --copy        Copy transcription to clipboard when done (macOS only)\n");
-    fprintf(stderr, "  --space       Hold spacebar to record, release to stop (macOS only)\n");
+    fprintf(stderr, "  --space       Press SPACE to record, ENTER to stop (macOS only)\n");
     fprintf(stderr, "  --debug       Debug output (per-layer, per-chunk details)\n");
     fprintf(stderr, "  --silent      No status output (only transcription on stdout)\n");
     fprintf(stderr, "  -h            Show this help\n");
@@ -217,30 +202,19 @@ static void tty_restore(void) {
     }
 }
 
-/* Check if spacebar is currently pressed (non-blocking, with state tracking).
-   Uses key-repeat timeout since terminals don't send key release events in raw mode. */
-static int spacebar_is_pressed(void) {
+static int read_terminal_key(void) {
     char c;
-    int saw_space = 0;
     while (read(STDIN_FILENO, &c, 1) > 0) {
         if (c == ' ') {
-            saw_space = 1;
-            spacebar_last_seen_ms = current_time_ms();
+            return ' ';
+        } else if (c == '\r' || c == '\n') {
+            return '\n';
         } else if (c == 3 || c == 'q' || c == 'Q') { /* Ctrl+C or q */
             tty_restore();
             exit(0);
         }
     }
-    if (saw_space) {
-        spacebar_held = 1;
-    } else if (spacebar_held) {
-        /* Check if we've timed out (no space seen recently = key released) */
-        uint64_t now = current_time_ms();
-        if (now - spacebar_last_seen_ms > SPACEBAR_TIMEOUT_MS) {
-            spacebar_held = 0;
-        }
-    }
-    return spacebar_held;
+    return -1;
 }
 
 static void configure_stream(vox_stream_t *s, int continuous, float interval) {
@@ -522,7 +496,7 @@ int main(int argc, char **argv) {
             drain_tokens(s);
         }
     } else if (use_space) {
-        /* Spacebar hold-to-record mode - loops until Ctrl+C */
+        /* Terminal-controlled recording mode - loops until Ctrl+C */
         if (vox_mic_start() != 0) {
             vox_stream_free(s);
             vox_free(ctx);
@@ -543,15 +517,17 @@ int main(int argc, char **argv) {
         sigaction(SIGINT, &sa, NULL);
 
         if (vox_verbose >= 1)
-            fprintf(stderr, "Hold SPACE to record, release to stop (Ctrl+C to exit)...\n");
+            fprintf(stderr, "Press SPACE to record, ENTER to stop (q or Ctrl+C to exit)...\n");
 
         /* Main loop - keep recording until interrupted */
         while (!mic_interrupted) {
-            /* Wait for spacebar press */
+            /* Wait for start signal */
             if (vox_verbose >= 1)
-                fprintf(stderr, "\nWaiting for spacebar...\n");
+                fprintf(stderr, "\nWaiting for SPACE...\n");
 
-            while (!mic_interrupted && !spacebar_is_pressed()) {
+            while (!mic_interrupted) {
+                if (read_terminal_key() == ' ')
+                    break;
                 usleep(10000); /* 10ms */
             }
 
@@ -565,9 +541,9 @@ int main(int argc, char **argv) {
             int is_recording = 1;
 
             while (!mic_interrupted && is_recording) {
-                /* Check if spacebar is still pressed */
-                if (!spacebar_is_pressed()) {
-                    /* Spacebar released - stop recording */
+                int key = read_terminal_key();
+                if (key == '\n') {
+                    /* Explicit stop signal */
                     is_recording = 0;
                     break;
                 }
@@ -614,8 +590,8 @@ int main(int argc, char **argv) {
             }
             configure_stream(s, 0, interval);
 
-            /* Small delay to debounce spacebar release */
-            usleep(200000); /* 200ms */
+            /* Avoid treating a buffered newline as the next command. */
+            usleep(100000); /* 100ms */
         }
 
         vox_mic_stop();
