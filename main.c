@@ -543,8 +543,13 @@ int main(int argc, char **argv) {
             while (!mic_interrupted && is_recording) {
                 int key = read_terminal_key();
                 if (key == '\n') {
-                    /* Explicit stop signal */
+                    /* Explicit stop signal - drain remaining mic audio */
                     is_recording = 0;
+                    int n;
+                    while ((n = vox_mic_read(mic_buf, 4800)) > 0) {
+                        vox_stream_feed(s, mic_buf, n);
+                        drain_tokens(s);
+                    }
                     break;
                 }
 
